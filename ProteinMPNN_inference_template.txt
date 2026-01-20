@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name="ProteinMPNN_inference_äääää_ööööö_ééééé_èèèèè_mll"
+#SBATCH -N 1 # number of nodes
+#SBATCH -c 16 # number of cores
+#SBATCH --gres=gpu:a5000:1
+#SBATCH --mem 128G # memory pool for all cores
+#SBATCH --time 720:00:00
+#SBATCH -o ProteinMPNN_inference_mll_äääää_ööööö_ééééé_èèèèè.%N.%j.out # STDOUT
+#SBATCH -e ProteinMPNN_inference_mll_äääää_ööööö_ééééé_èèèèè.%N.%j.err # STDERR
+
+# --- Setup environment ---
+eval "$(micromamba shell.bash hook)"
+micromamba activate RF2
+
+# --- Define inputs ---
+MONOMER_TEST_PDBS=$(find /scratch/jgut/blosum_distance/CARBonAra/results/model_comparison/benchmark_data/wt/monomers -type f -name '*.pdb')
+
+model_folder=/scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll
+EPOCH200_PATH=$(ls /scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll/model_weights/epoch200* 2>/dev/null | head -n 1)
+model_name=$(basename "$EPOCH200_PATH")
+model_name=${model_name::-3}
+for monomer_test_pdb in $MONOMER_TEST_PDBS; do
+    monomer_test_name=$(basename "$monomer_test_pdb")
+    # Create corresponding fasta path (replace .pdb → .fasta)
+    fasta_path="${monomer_test_pdb%.pdb}.fasta"
+    # Remove file extension safely for naming
+    pdb_label="${monomer_test_name%.pdb}"
+
+    # Define output directory
+    
+    out_dir="${model_folder}/output/${pdb_label}"
+    rm -r $out_dir
+    if [ ! -e "$out_dir" ]; then
+        python /data/jgut/ProteinMPNN/protein_mpnn_run.py \
+            --path_to_fasta "$fasta_path" \
+            --pdb_path "$monomer_test_pdb" \
+            --out_folder "$out_dir" \
+            --path_to_model_weights "${model_folder}/model_weights" \
+            --model_name "$model_name" \
+            --seed 6217 \
+            --save_probs 1\
+            --num_seq_per_target 1 \
+            --sampling_temp 0.1
+    fi
+done

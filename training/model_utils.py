@@ -13,8 +13,7 @@ import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import random
-import itertools
-
+from blosum_distance import BLOSUM60_DISTANCE
 
 def featurize(batch, device):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
@@ -125,9 +124,11 @@ def featurize(batch, device):
     return X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all
 
 
-def loss_nll(S, log_probs, mask):
+def loss_nll(S, log_probs, mask, take_softmax=False):
     """ Negative log probabilities """
     criterion = torch.nn.NLLLoss(reduction='none')
+    if take_softmax:
+        log_probs = F.log_softmax(log_probs, dim=-1)
     loss = criterion(
         log_probs.contiguous().view(-1, log_probs.size(-1)), S.contiguous().view(-1)
     ).view(S.size())
@@ -136,19 +137,84 @@ def loss_nll(S, log_probs, mask):
     loss_av = torch.sum(loss * mask) / torch.sum(mask)
     return loss, loss_av, true_false
 
-
-def loss_smoothed(S, log_probs, mask, weight=0.1):
-    """ Negative log probabilities """
-    S_onehot = torch.nn.functional.one_hot(S, 21).float()
-
-    # Label smoothing
-    S_onehot = S_onehot + weight / float(S_onehot.size(-1))
-    S_onehot = S_onehot / S_onehot.sum(-1, keepdim=True)
-
-    loss = -(S_onehot * log_probs).sum(-1)
-    loss_av = torch.sum(loss * mask) / 2000.0 #fixed 
+def loss_multimargin(S, y, mask, reduction='meanAboveAvg', distance=BLOSUM60_DISTANCE):
+    # sepMargin=None, weightPerClass=None, powParam=1.0, reduction='meanAboveAvg'
+    distance = distance.to(device=S.device,dtype=y.dtype)
+    if len(S.size())==1:
+        S = S.expand(0,1)
+    loss = multi_margin_loss(S,y, sepMargin=None, weightPerClass=None, powParam=1.0, reduction='meanAboveAvg', distances=distance)
+    loss_av = torch.sum(loss*mask)/2000.0
     return loss, loss_av
 
+def loss_rce(S, log_probs, mask, distance=None, alpha=1, beta=1, all_distances=None):
+    probs = torch.exp(log_probs)
+    S_onehot = torch.nn.functional.one_hot(S, 21).float()
+    normalised_ce_upper = (S_onehot*log_probs*alpha).sum(-1)
+    normalised_ce_lower = log_probs.sum(-1)
+    normalised_rce_upper = (distance(S)*probs*beta).sum(-1)
+    normalised_rce_lower = (all_distances(S)*probs).sum(-1)
+    loss = ((normalised_ce_upper/normalised_ce_lower) + (normalised_rce_upper/normalised_rce_lower))
+    #print(f"loss: {loss}")
+    #print(f"loss.shape: {loss.shape}")
+    #print(f"mask.shape: {mask.shape}")
+    #print(f"mask: {mask}")
+    loss_av = torch.sum(loss*mask)
+    #positive number
+    return loss, loss_av
+
+def loss_ordinal(S, log_probs, mask, weight=0.1, distance=None):
+    # https://aclanthology.org/2022.coling-1.407.pdf
+    # https://aclanthology.org/2024.findings-acl.320/
+    probs = torch.exp(log_probs)
+    loss = -(torch.log(1-probs)*distance(S)).sum(-1)
+    loss_av = torch.sum(loss * mask)
+    return loss, loss_av, loss_av
+    cross_entropy = nn.CrossEntropyLoss(reduction="none")
+    #S.dims = [Batch, Max_len]
+    #y.dims = [Batch, Max_len, residues]
+    #mask.dims = [Batch, Max_len]
+    #distance.dims = [residues, residues]
+    distance = distance.to(device=S.device,dtype=y.dtype)
+    if len(S.size())==1:
+        S = S.expand(0,1)
+    targets = torch.nn.functional.one_hot(S.reshape([-1]), 21).float()
+    if not (distance is None):
+        ordinal_change = torch.sum(torch.matmul(targets,distance).detach(),-1)**alpha
+    loss = (cross_entropy(y.reshape([-1,21]).float(),targets) * ordinal_change.float()).reshape(S.size()[0], -1)
+    loss_av = torch.sum(loss*mask)
+    return loss, loss_av
+
+def loss_smoothed(S, log_probs, mask, weight=0.1, soft_labels=None):
+    """ Negative log probabilities """
+    if soft_labels is None:
+        S_onehot = torch.nn.functional.one_hot(S, 21).float()
+        # Label smoothing
+        S_onehot = S_onehot + weight / float(S_onehot.size(-1))
+        smoothed_labels = S_onehot / S_onehot.sum(-1, keepdim=True)
+    else:
+        smoothed_labels = soft_labels(S)
+    loss = -(smoothed_labels * log_probs).sum(-1)
+    loss_av = torch.sum(loss * mask)
+    return loss, loss_av
+
+#def loss_smoothed(S, log_probs, mask, weight=0.1, smoothed_labels=None):
+#    """ Negative log probabilities """
+#    if smoothed_labels is None:
+#        S_onehot = torch.nn.functional.one_hot(S, 21).float()
+#        # Label smoothing
+#        S_onehot = S_onehot + weight / float(S_onehot.size(-1))
+#        smoothed_labels = S_onehot / S_onehot.sum(-1, keepdim=True)
+#    loss = -(smoothed_labels * log_probs).sum(-1)
+#    loss_av = torch.sum(loss * mask)
+#    return loss, loss_av
+
+def loss_emd(S, log_probs, mask, omega, mu, distance):
+    #https://arxiv.org/pdf/1611.05916
+    probs = torch.square(torch.exp(log_probs))
+    loss = (probs*(torch.pow(distance(S), omega)-mu) ).sum(-1)
+    abs_emd = torch.sum(torch.abs(loss*mask))
+    loss_av = torch.sum(loss * mask)
+    return loss, loss_av, abs_emd
 
 # The following gather functions
 def gather_edges(edges, neighbor_idx):

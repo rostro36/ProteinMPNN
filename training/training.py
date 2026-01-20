@@ -1,5 +1,6 @@
 import argparse
 import os.path
+from pathlib import Path
 
 def main(args):
     import json, time, os, sys, glob
@@ -18,12 +19,13 @@ def main(args):
     import subprocess
     from concurrent.futures import ProcessPoolExecutor    
     from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader
-    from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN
+    from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN, loss_ordinal, loss_emd, loss_rce
 
+    from blosum_distance import BLOSUM60_DISTANCE, CROSS_ENTROPY_DISTANCE, RANDOM_DISTANCE, BLOSUM60_DISTANCE_NP, CROSS_ENTROPY_DISTANCE_NP, RANDOM_DISTANCE_NP, make_softlabels, make_distance_embedding, make_all_distances
     scaler = torch.cuda.amp.GradScaler()
      
     device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
-
+    print(f"Running on {device}.")
     base_folder = time.strftime(args.path_for_outputs, time.localtime())
 
     if base_folder[-1] != '/':
@@ -66,12 +68,10 @@ def main(args):
         args.batch_size = 1000
 
     train, valid, test = build_training_clusters(params, args.debug)
-     
     train_set = PDB_dataset(list(train.keys()), loader_pdb, train, params)
     train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
     valid_set = PDB_dataset(list(valid.keys()), loader_pdb, valid, params)
     valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
-
 
     model = ProteinMPNN(node_features=args.hidden_dim, 
                         edge_features=args.hidden_dim, 
@@ -93,13 +93,38 @@ def main(args):
         total_step = 0
         epoch = 0
 
-    optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
-
+    #optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
+    #return NoamOpt(
+    #    d_model, 2, 4000, torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9), step
+    #)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08) # PyTorch default
 
     if PATH:
-        optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    matrix_name = args.matrix
+    beta = float(args.beta) # changed to float for mll
+    if matrix_name == "pretraining":
+        distance_embedding = None
+    elif matrix_name == "crossentropy":
+        softlabels = make_softlabels(CROSS_ENTROPY_DISTANCE_NP, beta=int(beta), proba=False, weight=float(args.omega)).to(device)
+        distance_embedding = make_distance_embedding(CROSS_ENTROPY_DISTANCE, beta).to(device)
+        if args.type == "apl":
+            all_distances = make_all_distances(CROSS_ENTROPY_DISTANCE, beta).to(device)
+    elif matrix_name == "blosum":
+        softlabels = make_softlabels(BLOSUM60_DISTANCE_NP, beta=int(beta), proba=False, weight=float(args.omega)).to(device)
+        distance_embedding = make_distance_embedding(BLOSUM60_DISTANCE, beta).to(device)
+        if args.type == "apl":
+            all_distances = make_all_distances(BLOSUM60_DISTANCE, beta).to(device)
+    elif matrix_name == "blosum_probability":
+        distance_embedding = make_distance_embedding(BLOSUM60_DISTANCE, beta, proba=True).to(device)
+        softlabels = make_softlabels(BLOSUM60_DISTANCE_NP, beta=int(beta), proba=True, weight=float(args.omega)).to(device)        
+        if args.type == "apl":
+            all_distances = make_all_distances(BLOSUM60_DISTANCE, beta, proba=True).to(device)
+    else:
+        softlabels = make_softlabels(RANDOM_DISTANCE_NP, beta=int(beta), proba=False, weight=float(args.omega) ).to(device)
+        distance_embedding = make_distance_embedding(RANDOM_DISTANCE, beta).to(device)
+        if args.type == "apl":
+            all_distances = make_all_distances(RANDOM_DISTANCE, beta).to(device)
     with ProcessPoolExecutor(max_workers=12) as executor:
         q = queue.Queue(maxsize=3)
         p = queue.Queue(maxsize=3)
@@ -114,7 +139,6 @@ def main(args):
         
         loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
         loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
-        
         reload_c = 0 
         for e in range(args.num_epochs):
             t0 = time.time()
@@ -143,10 +167,30 @@ def main(args):
                 if args.mixed_precision:
                     with torch.cuda.amp.autocast():
                         log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-                        _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
-           
-                    scaler.scale(loss_av_smoothed).backward()
-                     
+                        #_, loss_av_smoothed = loss_ordinal(S, log_probs, mask_for_loss, distance=None)
+                        #if args.matrix != "pretraining" and args.lambd !=0 :
+                        #    if args.ordinal:
+                        #        _, loss_av_emd, abs_emd = loss_ordinal(S, log_probs, mask, distance=distance_embedding)
+                        #    else:
+                        #        _, loss_av_emd, abs_emd = loss_emd(S, log_probs, mask, args.omega, args.mu, distance_embedding)
+                        #    scaling = (torch.abs(loss_av_smoothed)/(args.lambd*abs_emd+1e-10)).detach() 
+                        #    print(f"scalin {scaling}")
+                        #    #scaling = min(1, scaling)
+                        #    comb_loss = loss_av_smoothed+scaling*loss_av_emd
+                        if args.matrix == "pretraining":
+                            _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss, soft_labels=None)
+                            comb_loss = loss_av_smoothed
+                        elif args.type == "ordinal":
+                            _, comb_loss, abs_emd = loss_ordinal(S, log_probs, mask, distance=distance_embedding)
+                        elif args.type == "emd":
+                            _, comb_loss, _ = loss_emd(S, log_probs, mask, args.omega, args.mu, distance_embedding)
+                        elif args.type == "apl":
+                            _, comb_loss = loss_rce(S, log_probs, mask, distance=distance_embedding, alpha=float(args.alpha), beta=float(args.mu), all_distances=all_distances)
+                        else:
+                            _, comb_loss = loss_smoothed(S, log_probs, mask_for_loss, soft_labels=softlabels)
+                    #["pretraining", "apl", "smoothing", "emd", "ordinal"]
+                    scaler.scale(comb_loss).backward()
+                    print(f"comb_loss: {comb_loss.item()}")
                     if args.gradient_norm > 0.0:
                         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
 
@@ -154,9 +198,29 @@ def main(args):
                     scaler.update()
                 else:
                     log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-                    _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
-                    loss_av_smoothed.backward()
-
+                        #_, loss_av_smoothed = loss_ordinal(S, log_probs, mask_for_loss, distance=None)
+                        #if args.matrix != "pretraining" and args.lambd !=0 :
+                        #    if args.ordinal:
+                        #        _, loss_av_emd, abs_emd = loss_ordinal(S, log_probs, mask, distance=distance_embedding)
+                        #    else:
+                        #        _, loss_av_emd, abs_emd = loss_emd(S, log_probs, mask, args.omega, args.mu, distance_embedding)
+                        #    scaling = (torch.abs(loss_av_smoothed)/(args.lambd*abs_emd+1e-10)).detach() 
+                        #    print(f"scalin {scaling}")
+                        #    #scaling = min(1, scaling)
+                        #    comb_loss = loss_av_smoothed+scaling*loss_av_emd
+                    if args.matrix == "pretraining":
+                        _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss, soft_labels=None)
+                        comb_loss = loss_av_smoothed
+                    elif args.type == "ordinal":
+                        _, comb_loss, abs_emd = loss_ordinal(S, log_probs, mask, distance=distance_embedding)
+                    elif args.type == "emd":
+                        _, comb_loss, _ = loss_emd(S, log_probs, mask, args.omega, args.mu, distance_embedding)
+                    elif args.type == "apl":
+                        _, comb_loss = loss_rce(S, log_probs, mask, distance=distance_embedding, alpha=float(args.alpha), beta=beta, all_distances=all_distances)
+                    else:
+                        _, comb_loss = loss_smoothed(S, log_probs, mask_for_loss, soft_labels=softlabels)
+                    scaler.scale(comb_loss).backward()
+                    #print(f"comb_loss: {comb_loss.item()}")
                     if args.gradient_norm > 0.0:
                         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
 
@@ -209,7 +273,7 @@ def main(args):
                         'num_edges' : args.num_neighbors,
                         'noise_level': args.backbone_noise,
                         'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.optimizer.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
                         }, checkpoint_filename_last)
 
             if (e+1) % args.save_model_every_n_epochs == 0:
@@ -220,13 +284,12 @@ def main(args):
                         'num_edges' : args.num_neighbors,
                         'noise_level': args.backbone_noise, 
                         'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.optimizer.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
                         }, checkpoint_filename)
 
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
     argparser.add_argument("--path_for_training_data", type=str, default="my_path/pdb_2021aug02", help="path for loading training data") 
     argparser.add_argument("--path_for_outputs", type=str, default="./exp_020", help="path for logs and model weights")
     argparser.add_argument("--previous_checkpoint", type=str, default="", help="path for previous model weights, e.g. file.pt")
@@ -246,6 +309,21 @@ if __name__ == "__main__":
     argparser.add_argument("--debug", type=bool, default=False, help="minimal data loading for debugging")
     argparser.add_argument("--gradient_norm", type=float, default=-1.0, help="clip gradient norm, set to negative to omit clipping")
     argparser.add_argument("--mixed_precision", type=bool, default=True, help="train with mixed precision")
- 
-    args = argparser.parse_args()    
+    argparser.add_argument("--type", type=str, choices=["pretraining", "apl", "smoothing", "emd", "ordinal"], help="Type of loss")
+    argparser.add_argument("--alpha", type=float, default=0, help="Alpha for APL")
+    argparser.add_argument("--beta", type=float, default=1, help="Beta for soft-labels")
+    argparser.add_argument("--omega", type=float, default=0.1, help="Omega for EMD or epsilon for noise")
+    argparser.add_argument("--mu", type=float, default=0.25, help="Mu for EMD or beta for APL passive component")
+    argparser.add_argument("--lambd", type=float, default=3.5, help="Ratio between normal loss and EMD/OLL")
+    argparser.add_argument("--matrix", type=str, choices=["pretraining","crossentropy", "blosum", "random", "blosum_probability"], default="pretraining",help="Type of matrix to use. Options: pretraining, crossentropy, blosum, random (default: pretraining)")
+    argparser.add_argument("--lr", type=float, default=1e-4, help="Learning rate, default 1e-4")
+    args = argparser.parse_args()
+    print(f"type {args.type}")
+    print(f"Alpha {args.alpha}")
+    print(f"Beta {args.beta}")
+    print(f"Omega {args.omega}")
+    print(f"Mu {args.mu}")
+    print(f"Lambda {args.lambd}")
+    print(f"Matrix {args.matrix}")
+    print(f"Learning rate {args.lr}")
     main(args)   

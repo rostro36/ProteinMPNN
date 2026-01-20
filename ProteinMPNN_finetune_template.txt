@@ -1,0 +1,20 @@
+#!/bin/bash
+#SBATCH --job-name="ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll"
+#SBATCH -N 1 # number of nodes
+#SBATCH -c 16 # number of cores
+#SBATCH --gres=gpu:a5000:1
+#SBATCH --mem 128G # memory pool for all cores
+#SBATCH --time 720:00:00
+#SBATCH -o ProteinMPNN_finetune_mll_äääää_ööööö_ééééé_èèèèè.%N.%j.out # STDOUT
+#SBATCH -e ProteinMPNN_finetune_mll_äääää_ööööö_ééééé_èèèèè.%N.%j.err # STDERR
+
+eval "$(micromamba shell.bash hook)"
+micromamba activate RF2
+
+mkdir -p /scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll/model_weights
+#sleep 10
+#EPOCH5_PATH=$(ls /scratch/jgut/ProteinMPNN_models/normal_adam/model_weights/epoch5_* 2>/dev/null | head -n 1)
+#FILENAME=$(basename "$EPOCH5_PATH")
+#cp $EPOCH5_PATH /scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll/model_weights/$FILENAME
+#python /ibmm_data/jgut/ProteinMPNN/training/training.py --path_for_training_data=/scratch/jgut/ProteinMPNN_data/pdb_2021aug02 --path_for_outputs=/scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll --previous_checkpoint /scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll/model_weights/$FILENAME --num_epochs=195 --save_model_every_n_epochs=5 --reload_data_every_n_epochs=2 --num_examples_per_epoch=1000000 --batch_size=10000 --max_protein_length=10000 --hidden_dim=128 --num_encoder_layers=3 --num_decoder_layers=3 --num_neighbors=48 --dropout=0.1 --backbone_noise=0.2 --rescut=3.5 --gradient_norm=1 --mixed_precision=True --matrix=äääää --beta=1 --lr=0.0001 --mu=ööööö --omega=ééééé --lambd=èèèèè
+python /ibmm_data/jgut/ProteinMPNN/training/training.py --path_for_training_data=/scratch/jgut/ProteinMPNN_data/pdb_2021aug02 --path_for_outputs=/scratch/jgut/ProteinMPNN_models/ProteinMPNN_finetune_äääää_ööööö_ééééé_èèèèè_mll --num_epochs=200 --save_model_every_n_epochs=5 --reload_data_every_n_epochs=2 --num_examples_per_epoch=1000000 --batch_size=10000 --max_protein_length=10000 --hidden_dim=128 --num_encoder_layers=3 --num_decoder_layers=3 --num_neighbors=48 --dropout=0.1 --backbone_noise=0.2 --rescut=3.5 --gradient_norm=1 --mixed_precision=True --matrix=äääää --ordinal --beta=ööööö --lr=0.0001 --mu=0 --omega=ééééé --lambd=èèèèè
